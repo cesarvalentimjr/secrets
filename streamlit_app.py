@@ -61,13 +61,20 @@ def fetch_season(year: int) -> dict | None:
 
 
 @st.cache_data(show_spinner=False)
-def fetch_season_complete(year: int, progress_callback=None) -> dict | None:
+def fetch_season_complete(year: int, _progress_callback=None) -> dict | None:
     """Contorna o truncamento do plano gratuito buscando rodada por
     rodada (eventsround.php?id=...&r=N&s=...) — cada chamada devolve
     só ~10 jogos, abaixo do limite que trunca a chamada de temporada
     inteira. Deduplica por idEvent (algumas rodadas reagendadas
     aparecem repetidas com IDs diferentes de partida, então a
-    deduplicação é por ID, não por rodada)."""
+    deduplicação é por ID, não por rodada).
+
+    O parâmetro come com "_" de propósito: st.cache_data tenta
+    "hashear" todo argumento pra montar a chave de cache, e uma
+    função (o callback de progresso) não é hasheável. Prefixo com
+    underscore é a convenção do Streamlit pra dizer "ignora isso no
+    cálculo do cache" — sem isso, a chamada quebra com
+    UnhashableParamError."""
 
     all_events: dict[str, dict] = {}  # idEvent -> registro, pra deduplicar
 
@@ -89,8 +96,8 @@ def fetch_season_complete(year: int, progress_callback=None) -> dict | None:
                 for e in events:
                     all_events[e["idEvent"]] = e
 
-            if progress_callback:
-                progress_callback(round_num, MAX_ROUNDS)
+            if _progress_callback:
+                _progress_callback(round_num, MAX_ROUNDS)
             time.sleep(0.25)  # gentil com o limite de 30 req/min do plano gratuito
 
         if got_any:
@@ -207,7 +214,7 @@ if run_button:
                 round_num / max_rounds, text=f"  Temporada {_year}: rodada {round_num}/{max_rounds}"
             )
 
-        data = fetch_season_complete(year, progress_callback=_report_round)
+        data = fetch_season_complete(year, _progress_callback=_report_round)
         if data:
             raw_payloads[year] = data
 
