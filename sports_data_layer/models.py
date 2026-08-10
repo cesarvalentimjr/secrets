@@ -66,13 +66,33 @@ class Match:
     away_team: Team
     home_score: int | None = None
     away_score: int | None = None
-    status: str = "scheduled"  # scheduled | live | finished
+    status: str = "scheduled"  # valor bruto do provedor — vocabulário varia (FT, finished, Match Finished...)
     events: list[MatchEvent] = field(default_factory=list)
     lineups: list[Lineup] = field(default_factory=list)
 
+    # Vocabulário conhecido de "terminado" entre provedores. Isto é só
+    # um sinal auxiliar — o sinal PRINCIPAL, mais confiável na prática,
+    # é score preenchido (ver is_finished abaixo). Ampliar esta lista
+    # não é obrigatório pra funcionar, só ajuda diagnóstico/clareza.
+    _FINISHED_STATUS_TOKENS = frozenset(
+        {"finished", "ft", "aet", "pen", "awd", "wo", "match finished", "full time"}
+    )
+
     @property
     def is_finished(self) -> bool:
-        return self.status == "finished"
+        """Regressão real: a primeira versão só aceitava status ==
+        "finished" — mas a TheSportsDB (e a maioria dos provedores
+        reais) usa "FT". Isso fazia TODO jogo real ser descartado
+        antes de qualquer hipótese rodar, mesmo com milhares de
+        partidas carregadas, porque os testes automatizados usavam
+        "finished" escrito à mão nos dados de teste, mascarando o
+        problema. O sinal principal agora é o placar estar
+        preenchido — isso é verdadeiro independente de qual palavra
+        o provedor usa pra "terminado"."""
+
+        if self.home_score is not None and self.away_score is not None:
+            return True
+        return bool(self.status) and self.status.strip().lower() in self._FINISHED_STATUS_TOKENS
 
 
 @dataclass
