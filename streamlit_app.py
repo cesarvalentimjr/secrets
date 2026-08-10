@@ -33,6 +33,13 @@ ROUND_URL = f"https://www.thesportsdb.com/api/v1/json/{API_KEY}/eventsround.php"
 TABLE_URL = f"https://www.thesportsdb.com/api/v1/json/{API_KEY}/lookuptable.php"
 PROVIDER_NAME = "thesportsdb_streamlit"
 COMPETITION = "brasileirao_a"
+# 30 requisições/minuto no plano gratuito = 1 a cada 2s. 2.2s dá uma
+# margem de segurança — o sleep anterior (0.25s) permitia ~240/min,
+# 8x acima do limite, e foi isso que causou o "300 → 160 → 100 → 0"
+# no seu teste: a partir de um certo ponto, toda chamada levava 429
+# (limite excedido) e virava silenciosamente "nenhum jogo".
+RATE_LIMIT_DELAY_SECONDS = 2.2
+MAX_CONSECUTIVE_FAILURES = 5  # se bater isso, é bloqueio persistente — pausa mais longa
 MAX_ROUNDS = 42  # Brasileirão tem 38, +margem para copas/reagendamentos
 
 
@@ -41,64 +48,72 @@ MAX_ROUNDS = 42  # Brasileirão tem 38, +margem para copas/reagendamentos
 # ---------------------------------------------------------------------------
 
 @st.cache_data(show_spinner=False)
-def fetch_season(year: int) -> dict | None:
-    """Chamada única pra temporada inteira. O plano gratuito da
-    TheSportsDB trunca essa resposta (documentado: 'Free Limit: 1'
-    contra 'Premium Limit: 500' nesse endpoint) — por isso isto é só
-    o caminho rápido; fetch_season_complete() abaixo é quem garante
-    a temporada inteira, buscando rodada por rodada."""
+def fetch_round(round_num: int, season_param: str) -> list[dict]:
+    """Busca UMA rodada. Cacheável de verdade: só argumentos simples
+    (int, str), nenhuma chamada de UI dentro.
 
-    for season_param in (str(year), f"{year}-{year + 1}"):
-        try:
-            resp = requests.get(EVENTS_URL, params={"id": LEAGUE_ID, "s": season_param}, timeout=15)
-            resp.raise_for_status()
-            data = resp.json()
-        except (requests.RequestException, ValueError):
-            continue
-        if data.get("events"):
-            return data
-    return None
+    IMPORTANTE: isto deixa a exceção propagar (raise_for_status sem
+    try/except aqui dentro) de propósito. Se a chamada falhar (ex:
+    HTTP 429 de rate limit), a exceção impede o Streamlit de cachear
+    o resultado — assim uma falha transitória não vira "essa rodada
+    não tem jogos" permanentemente guardado no cache da sessão. Quem
+    decide o que fazer com a falha é fetch_season_complete(), que não
+    é cacheada."""
+
+    resp = requests.get(
+        ROUND_URL, params={"id": LEAGUE_ID, "r": round_num, "s": season_param}, timeout=15
+    )
+    time.sleep(RATE_LIMIT_DELAY_SECONDS)  # só roda em cache miss — em cache hit, nem a espera acontece
+    resp.raise_for_status()
+    data = resp.json()
+    return data.get("events") or []
 
 
-@st.cache_data(show_spinner=False)
-def fetch_season_complete(year: int, _progress_callback=None) -> dict | None:
+def fetch_season_complete(year: int, progress_callback=None) -> dict | None:
     """Contorna o truncamento do plano gratuito buscando rodada por
     rodada (eventsround.php?id=...&r=N&s=...) — cada chamada devolve
     só ~10 jogos, abaixo do limite que trunca a chamada de temporada
-    inteira. Deduplica por idEvent (algumas rodadas reagendadas
-    aparecem repetidas com IDs diferentes de partida, então a
-    deduplicação é por ID, não por rodada).
+    inteira. Deduplica por idEvent.
 
-    O parâmetro come com "_" de propósito: st.cache_data tenta
-    "hashear" todo argumento pra montar a chave de cache, e uma
-    função (o callback de progresso) não é hasheável. Prefixo com
-    underscore é a convenção do Streamlit pra dizer "ignora isso no
-    cálculo do cache" — sem isso, a chamada quebra com
-    UnhashableParamError."""
+    Trata falha de rede (incluindo rate limit) como TRANSITÓRIA, não
+    como "a rodada não existe": tenta de novo uma vez após uma pausa
+    curta; se falhar de novo, desiste dessa rodada específica mas
+    continua tentando as próximas (uma rodada ruim não devia
+    contaminar a temporada inteira). Se acumular muitas falhas
+    seguidas, assume bloqueio persistente e pausa mais tempo antes de
+    continuar, em vez de martelar a API já bloqueada."""
 
-    all_events: dict[str, dict] = {}  # idEvent -> registro, pra deduplicar
+    all_events: dict[str, dict] = {}
+    consecutive_failures = 0
 
     for season_param in (str(year), f"{year}-{year + 1}"):
         got_any = False
-        for round_num in range(1, MAX_ROUNDS + 1):
-            try:
-                resp = requests.get(
-                    ROUND_URL, params={"id": LEAGUE_ID, "r": round_num, "s": season_param}, timeout=15
-                )
-                resp.raise_for_status()
-                data = resp.json()
-            except (requests.RequestException, ValueError):
-                continue
 
-            events = data.get("events") or []
+        for round_num in range(1, MAX_ROUNDS + 1):
+            events = []
+            try:
+                events = fetch_round(round_num, season_param)
+                consecutive_failures = 0
+            except requests.RequestException:
+                consecutive_failures += 1
+                time.sleep(RATE_LIMIT_DELAY_SECONDS * 2)  # pausa extra antes de tentar de novo
+                try:
+                    events = fetch_round(round_num, season_param)
+                    consecutive_failures = 0
+                except requests.RequestException:
+                    pass  # desiste desta rodada específica, mas segue pras próximas
+
+            if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
+                time.sleep(15)  # bloqueio persistente — dá um respiro maior antes de continuar
+                consecutive_failures = 0
+
             if events:
                 got_any = True
                 for e in events:
                     all_events[e["idEvent"]] = e
 
-            if _progress_callback:
-                _progress_callback(round_num, MAX_ROUNDS)
-            time.sleep(0.25)  # gentil com o limite de 30 req/min do plano gratuito
+            if progress_callback:
+                progress_callback(round_num, MAX_ROUNDS)
 
         if got_any:
             break  # esse formato de temporada (ano único vs ano-ano) funcionou, não tenta o outro
@@ -110,13 +125,17 @@ def fetch_season_complete(year: int, _progress_callback=None) -> dict | None:
 
 @st.cache_data(show_spinner=False)
 def fetch_standings(year: int) -> dict | None:
-    try:
-        resp = requests.get(TABLE_URL, params={"l": LEAGUE_ID, "s": str(year)}, timeout=15)
-        resp.raise_for_status()
-        data = resp.json()
-    except (requests.RequestException, ValueError):
-        return None
-    return data if data.get("table") else None
+    for season_param in (str(year), f"{year}-{year + 1}"):
+        try:
+            resp = requests.get(TABLE_URL, params={"l": LEAGUE_ID, "s": season_param}, timeout=15)
+            time.sleep(RATE_LIMIT_DELAY_SECONDS)
+            resp.raise_for_status()
+            data = resp.json()
+        except (requests.RequestException, ValueError):
+            continue
+        if data.get("table"):
+            return data
+    return None
 
 
 def load_matches(raw_payloads: dict[int, dict]) -> list:
@@ -214,7 +233,7 @@ if run_button:
                 round_num / max_rounds, text=f"  Temporada {_year}: rodada {round_num}/{max_rounds}"
             )
 
-        data = fetch_season_complete(year, _progress_callback=_report_round)
+        data = fetch_season_complete(year, progress_callback=_report_round)
         if data:
             raw_payloads[year] = data
 
